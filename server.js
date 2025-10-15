@@ -86,3 +86,206 @@ function decrypt(encryptedData) {
     return null;
   }
 }
+
+// routes
+
+// user registration
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+
+    // validate input
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    
+    // hash password
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // insert user into database
+    db.run(
+      'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+      [username, email, passwordHash],
+      function(err) {
+        if (err) {
+          if (err.message.includes('UNIQUE constraint failed')) {
+            return res.status(400).json({ error: 'Username or email already exists' });
+          }
+          return res.status(500).json({ error: 'Database error' });
+        }
+
+        // Generate JWT token
+        const token = jwt.sign(
+          { id: this.lastID, username },
+          JWT_SECRET,
+          { expiresIn: '10m' }
+        );
+
+        res.status(201).json({
+          message: 'User created successfully',
+          token,
+          user: { id: this.lastID, username, email }
+        });
+      }
+    );
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// user login
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+
+  // validate input
+  if (!username || !password) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
+
+  // find user in database
+  db.get(
+    'SELECT * FROM users WHERE username = ? OR email = ?',
+    [username, username],
+    async (err, user) => {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      try {
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        
+        if (!validPassword) {
+          return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+          { id: user.id, username: user.username },
+          JWT_SECRET,
+          { expiresIn: '24h' }
+        );
+
+        res.json({
+          message: 'Login successful',
+          token,
+          user: { id: user.id, username: user.username, email: user.email }
+        });
+      } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+      }
+    }
+  );
+});
+ 
+// get all stored passwords for a user
+app.get('/api/passwords', authenticateToken, (req, res) => {
+  db.all(
+    'SELECT * FROM stored_passwords WHERE user_id = ? ORDER BY service_name',
+    [req.user.id],
+    (err, passwords) => {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      // Decrypt passwords before sending
+      const decryptedPasswords = passwords.map(pwd => ({
+        ...pwd,
+        password: decrypt(pwd.encrypted_password)
+      }));
+
+      res.json(decryptedPasswords);
+    }
+  );
+});
+
+// add new password
+app.post('/api/passwords', authenticateToken, (req, res) => {
+  const { service_name, username, password, url, notes } = req.body;
+
+  if (!service_name || !username || !password) {
+    return res.status(400).json({ error: 'Service name, username, and password are required' });
+  }
+
+  const encryptedPassword = encrypt(password);
+
+  db.run(
+    'INSERT INTO stored_passwords (user_id, service_name, username, encrypted_password, url, notes) VALUES (?, ?, ?, ?, ?, ?)',
+    [req.user.id, service_name, username, encryptedPassword, url || '', notes || ''],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      res.status(201).json({
+        message: 'Password saved successfully',
+        id: this.lastID
+      });
+    }
+  );
+});
+
+// update password
+app.put('/api/passwords/:id', authenticateToken, (req, res) => {
+  const { service_name, username, password, url, notes } = req.body;
+  const passwordId = req.params.id;
+
+  if (!service_name || !username || !password) {
+    return res.status(400).json({ error: 'Service name, username, and password are required' });
+  }
+
+  const encryptedPassword = encrypt(password);
+
+  db.run(
+    'UPDATE stored_passwords SET service_name = ?, username = ?, encrypted_password = ?, url = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+    [service_name, username, encryptedPassword, url || '', notes || '', passwordId, req.user.id],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Password not found' });
+      }
+
+      res.json({ message: 'Password updated successfully' });
+    }
+  );
+});
+
+// Delete password
+app.delete('/api/passwords/:id', authenticateToken, (req, res) => {
+  const passwordId = req.params.id;
+
+  db.run(
+    'DELETE FROM stored_passwords WHERE id = ? AND user_id = ?',
+    [passwordId, req.user.id],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Password not found' });
+      }
+
+      res.json({ message: 'Password deleted successfully' });
+    }
+  );
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', message: 'Password Manager API is running' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log('Database initialized successfully');
+});
