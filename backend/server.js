@@ -35,11 +35,14 @@ db.serialize(() => {
   )`);
 });
 
-// JWT secret
-const JWT_SECRET = 'your-super-secret-jwt-key-change-in-production';
+// JWT secret (use environment variable in production)
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
 
-// Encryption setup
-const ENCRYPTION_KEY = crypto.randomBytes(32); // 256-bit key
+// Encryption setup (store securely in production)
+// Convert hex string to buffer if provided, otherwise generate random key
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY 
+  ? Buffer.from(process.env.ENCRYPTION_KEY, 'hex')
+  : crypto.randomBytes(32);
 const IV_LENGTH = 16;
 
 function encrypt(text) {
@@ -62,7 +65,8 @@ function decrypt(encryptedData) {
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
-  } catch {
+  } catch (err) {
+    console.error('Decryption error:', err);
     return null;
   }
 }
@@ -84,18 +88,23 @@ const authenticateToken = (req, res, next) => {
 app.post('/api/register', async (req, res) => {
   try {
     const { username, email, password } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'All fields required' });
+    }
     const passwordHash = await bcrypt.hash(password, 10);
     db.run(
       'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
       [username, email, passwordHash],
       function(err) {
-        if (err) return res.status(400).json({ error: 'Username or email exists' });
+        if (err) {
+          return res.status(400).json({ error: 'Username or email already exists' });
+        }
         const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET, { expiresIn: '24h' });
         res.status(201).json({ token, user: { id: this.lastID, username, email } });
       }
     );
-  } catch {
+  } catch (err) {
+    console.error('Registration error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -104,34 +113,95 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   db.get('SELECT * FROM users WHERE username = ? OR email = ?', [username, username], async (err, user) => {
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
     res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
   });
 });
 
-// Get passwords
+// Get all passwords
 app.get('/api/passwords', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM stored_passwords WHERE user_id = ?', [req.user.id], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    const passwords = rows.map(r => ({ ...r, password: decrypt(r.encrypted_password) }));
+  db.all('SELECT * FROM stored_passwords WHERE user_id = ? ORDER BY created_at DESC', [req.user.id], (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    const passwords = rows.map(r => ({ 
+      ...r, 
+      password: decrypt(r.encrypted_password) 
+    }));
     res.json(passwords);
   });
 });
 
-// Add password
+// Add new password
 app.post('/api/passwords', authenticateToken, (req, res) => {
   const { service_name, username, password } = req.body;
-  if (!service_name || !username || !password) return res.status(400).json({ error: 'All fields required' });
+  if (!service_name || !username || !password) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
   const encryptedPassword = encrypt(password);
   db.run(
     'INSERT INTO stored_passwords (user_id, service_name, username, encrypted_password) VALUES (?, ?, ?, ?)',
     [req.user.id, service_name, username, encryptedPassword],
     function(err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
       res.status(201).json({ id: this.lastID, service_name, username });
+    }
+  );
+});
+
+// Update password
+app.put('/api/passwords/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { service_name, username, password } = req.body;
+  
+  if (!service_name || !username || !password) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
+
+  const encryptedPassword = encrypt(password);
+  
+  db.run(
+    'UPDATE stored_passwords SET service_name = ?, username = ?, encrypted_password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+    [service_name, username, encryptedPassword, id, req.user.id],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Password not found' });
+      }
+      res.json({ message: 'Password updated successfully' });
+    }
+  );
+});
+
+// Delete password
+app.delete('/api/passwords/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  
+  db.run(
+    'DELETE FROM stored_passwords WHERE id = ? AND user_id = ?',
+    [id, req.user.id],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Password not found' });
+      }
+      res.json({ message: 'Password deleted successfully' });
     }
   );
 });
